@@ -287,7 +287,7 @@ fn handle_client(
                 }
                 Ok(ReadResult::Text(_)) => {} // do nothing
                 Ok(ReadResult::Pong(_)) => {} // do nothing
-                Ok(ReadResult::None) => {
+                Ok(ReadResult::Closed) => {
                     info!("client closed websocket connection");
                     tx_egres.send(Vec::new()).unwrap();
                     tx_ingres.send(TunnelCommand::ClientDisconnected).unwrap();

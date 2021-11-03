@@ -33,7 +33,7 @@ fn main() -> Result<(), FramerError<impl Error>> {
     let mut stream = TcpStream::connect(address).map_err(FramerError::Io)?;
     let mut stream_tx1 = stream.try_clone().expect("Unable to clone stream");
     let mut stream_tx2 = stream.try_clone().expect("Unable to clone stream");
-    info!("connected.");
+    info!("connected");
 
     let mut read_buf = [0; 4000];
     let mut read_cursor = 0;
@@ -144,7 +144,7 @@ fn main() -> Result<(), FramerError<impl Error>> {
                 }
             }
             Ok(ReadResult::Pong(_)) => {} // do nothing
-            Ok(ReadResult::None) => break,
+            Ok(ReadResult::Closed) => break,
             Err(e) => {
                 error!("framer read error: {:?}", e)
             }
