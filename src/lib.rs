@@ -7,4 +7,5 @@ pub enum TunnelCommand {
     Open,
     Close,
     Tx(Vec<u8>),
+    ClientDisconnected,
 }

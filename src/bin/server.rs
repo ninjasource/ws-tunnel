@@ -8,6 +8,7 @@ use log::{debug, error, info};
 use std::net::{TcpListener, TcpStream};
 use std::str::{from_utf8, Utf8Error};
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use std::{
@@ -66,12 +67,13 @@ fn accept_tunnel_connections(
     for stream in tunnel_listener.incoming() {
         match stream {
             Ok(mut stream) => {
+                info!("incomming tunnel connection from {:?}", stream.peer_addr());
                 let mut stream_clone = stream.try_clone().unwrap();
                 let tx_ingres_clone = tx_ingres.clone();
                 tx_ingres_clone.send(TunnelCommand::Open).unwrap();
                 let tx_egres_clone = tx_egres.clone();
                 thread::spawn(move || {
-                    info!("Reading bytes from tunnel and forwarding them to websocket");
+                    info!("reading bytes from tunnel and forwarding them to websocket");
                     let mut buf = vec![0_u8; 4 * 4096];
                     loop {
                         match stream.read(&mut buf) {
@@ -94,15 +96,25 @@ fn accept_tunnel_connections(
                     }
                 });
 
-                info!("Waiting for websocket bytes to forward");
+                info!("waiting for websocket bytes to forward");
+
+                let mut has_received_data = false;
 
                 loop {
                     match rx_egres.recv() {
                         Ok(bytes) => {
                             if bytes.len() == 0 {
-                                info!("stopped receiving from websocket");
-                                break;
+                                if has_received_data {
+                                    info!("rx_egres received 0 bytes and quitting");
+                                    break;
+                                } else {
+                                    info!("rx_egres received 0 bytes but continuing to receive");
+                                    continue;
+                                }
                             }
+
+                            debug!("rx_egres received {} bytes", bytes.len());
+                            has_received_data = true;
 
                             if let Err(e) = stream_clone.write_all(&bytes) {
                                 error!("stream write error: {:?}", e);
@@ -116,9 +128,9 @@ fn accept_tunnel_connections(
                     }
                 }
 
-                info!("No longer forwarding websocket bytes to tunnel");
+                info!("no longer forwarding websocket bytes to tunnel");
             }
-            Err(e) => error!("Failed to establish a connection: {}", e),
+            Err(e) => error!("failed to establish a connection: {}", e),
         }
     }
 }
@@ -132,35 +144,46 @@ fn main() -> std::io::Result<()> {
 
     let addr = format!("127.0.0.1:{}", config.server_ws_port);
     let listener = TcpListener::bind(&addr)?;
-    info!("Websocket Listening on: {}", &addr);
+    info!("websocket listening on: {}", &addr);
     let tcp_port = config.server_tcp_port;
+
+    let tunner_addr = format!("127.0.0.1:{}", tcp_port);
+    let tunnel_listener = TcpListener::bind(&tunner_addr)?;
+    info!("tunnel listening on: {}", &tunner_addr);
+
+    let (tx_ingres, rx_ingres) = channel::<TunnelCommand>();
+    let (tx_egres, rx_egres) = channel::<Vec<u8>>();
+
+    let tx_egres_clone = tx_egres.clone();
+    let tx_ingres_clone = tx_ingres.clone();
+    thread::spawn(move || {
+        accept_tunnel_connections(tunnel_listener, tx_ingres_clone, rx_egres, tx_egres_clone);
+        info!("stopped accepting tunnel connections")
+    });
+
+    let rx_ingres_mutex = Arc::new(Mutex::new(rx_ingres));
 
     // accept connections and process them serially
     for stream in listener.incoming() {
-        let (tx_ingres, rx_ingres) = channel::<TunnelCommand>();
-        let (tx_egres, rx_egres) = channel::<Vec<u8>>();
-
-        let tunner_addr = format!("127.0.0.1:{}", tcp_port);
-        let tunnel_listener = TcpListener::bind(&tunner_addr)?;
-        info!("Tunnel Listening on: {}", &tunner_addr);
-
-        let tx_egres_clone = tx_egres.clone();
-        thread::spawn(move || {
-            accept_tunnel_connections(tunnel_listener, tx_ingres, rx_egres, tx_egres_clone);
-            info!("stopped accepting tunnel connections")
-        });
-
-        let api_key = config.api_key.clone();
         match stream {
             Ok(stream) => {
-                thread::spawn(
-                    move || match handle_client(stream, tx_egres, rx_ingres, &api_key) {
-                        Ok(()) => info!("Connection closed"),
-                        Err(e) => error!("handle_client error: {:?}", e),
-                    },
+                info!(
+                    "incomming websocket connection from {:?}",
+                    stream.peer_addr()
                 );
+
+                let api_key = config.api_key.clone();
+                let rx_ingres_mutex = rx_ingres_mutex.clone();
+                let tx_egres = tx_egres.clone();
+                let tx_ingres = tx_ingres.clone();
+                thread::spawn(move || {
+                    match handle_client(stream, tx_egres, rx_ingres_mutex, tx_ingres, &api_key) {
+                        Ok(()) => info!("connection closed"),
+                        Err(e) => error!("handle_client error: {:?}", e),
+                    }
+                });
             }
-            Err(e) => error!("Failed to establish a connection: {}", e),
+            Err(e) => error!("failed to establish a connection: {}", e),
         }
     }
 
@@ -170,15 +193,13 @@ fn main() -> std::io::Result<()> {
 fn handle_client(
     mut stream: TcpStream,
     tx_egres: Sender<Vec<u8>>,
-    rx_ingres: Receiver<TunnelCommand>,
+    rx_ingres_mutex: Arc<Mutex<Receiver<TunnelCommand>>>,
+    tx_ingres: Sender<TunnelCommand>,
     api_key: &String,
 ) -> Result<()> {
-    info!("Client connected {}", stream.peer_addr()?);
+    info!("client connected {}", stream.peer_addr()?);
     let mut read_buf = [0; 4000];
     let mut read_cursor = 0;
-    //  const TIMEOUT: Duration = Duration::from_millis(50);
-
-    let mut stream_cloned = stream.try_clone().expect("Failed to clone stream");
 
     if let Some(websocket_context) =
         read_header(&mut stream, &mut read_buf, &mut read_cursor, api_key)?
@@ -196,18 +217,21 @@ fn handle_client(
 
         // complete the opening handshake with the client
         framer.accept(&mut stream, &websocket_context)?;
-        info!("Websocket connection opened");
+        info!("websocket connection opened");
 
+        let mut stream_cloned = stream.try_clone().expect("unable to clone stream");
         thread::spawn(move || {
             let mut to_buf = vec![0_u8; 4 * 4096];
             let mut websocket_tx = WebSocketServer::new_server();
             websocket_tx.state = WebSocketState::Open;
 
             loop {
+                let rx_ingres = rx_ingres_mutex.lock().unwrap();
+
                 // attempt to read from the channel and write websocket frame
                 match rx_ingres.recv() {
                     Ok(TunnelCommand::Open) => {
-                        info!("Sending 'open' stream message to websocket");
+                        info!("sending 'open' stream message to websocket");
                         write_to_websocket(
                             &mut websocket_tx,
                             &mut stream_cloned,
@@ -217,7 +241,7 @@ fn handle_client(
                         );
                     }
                     Ok(TunnelCommand::Close) => {
-                        info!("Sending 'close' stream message to websocket");
+                        info!("sending 'close' stream message to websocket");
                         write_to_websocket(
                             &mut websocket_tx,
                             &mut stream_cloned,
@@ -227,7 +251,8 @@ fn handle_client(
                         );
                     }
                     Ok(TunnelCommand::Tx(bytes)) => {
-                        debug!("Wrote {} bytes to websocket", bytes.len());
+                        debug!("sending {} bytes to websocket", bytes.len());
+
                         write_to_websocket(
                             &mut websocket_tx,
                             &mut stream_cloned,
@@ -235,6 +260,10 @@ fn handle_client(
                             &bytes,
                             &mut to_buf,
                         );
+                    }
+                    Ok(TunnelCommand::ClientDisconnected) => {
+                        info!("client disconnected, exiting websocket writer loop");
+                        break;
                     }
                     Err(e) => {
                         error!("rx_ingres disconnected: {:?}", e);
@@ -244,15 +273,12 @@ fn handle_client(
             }
         });
 
-        // so that we get a change to write if there is nothing on the line
-        //  stream.set_read_timeout(Some(TIMEOUT))?;
-
         // read loop
         loop {
             // attempt to read a websocket frame
             match framer.read(&mut stream, &mut frame_buf) {
                 Ok(ReadResult::Binary(bytes)) => {
-                    debug!("Received {} bytes from websocket", bytes.len());
+                    debug!("received {} bytes from websocket", bytes.len());
                     let bytes = Vec::from(bytes);
                     if let Err(e) = tx_egres.send(bytes) {
                         // this will only happen if we stop accepting incomming tcp connections for some reason
@@ -262,13 +288,11 @@ fn handle_client(
                 Ok(ReadResult::Text(_)) => {} // do nothing
                 Ok(ReadResult::Pong(_)) => {} // do nothing
                 Ok(ReadResult::None) => {
+                    info!("client closed websocket connection");
                     tx_egres.send(Vec::new()).unwrap();
+                    tx_ingres.send(TunnelCommand::ClientDisconnected).unwrap();
                     break; // usually when client has closed the connection
                 }
-                /*
-                Err(FramerError::Io(e)) if e.kind() == ErrorKind::WouldBlock => {
-                    // a normal timeout
-                }*/
                 Err(e) => {
                     error!("read_binary error: {:?}", e);
                     break;
@@ -276,7 +300,7 @@ fn handle_client(
             }
         }
 
-        info!("Closing websocket connection");
+        info!("closing websocket connection");
         Ok(())
     } else {
         Ok(())
@@ -290,6 +314,7 @@ fn write_to_websocket(
     from_buf: &[u8],
     to_buf: &mut [u8],
 ) {
+    // TODO: write in loop if buffer is too small
     let len = websocket
         .write(message_type, true, from_buf, to_buf)
         .unwrap();
@@ -360,7 +385,7 @@ fn read_header(
 
 fn return_401_unauthorized(stream: &mut TcpStream) -> Result<()> {
     thread::sleep(Duration::from_secs(2));
-    info!("Unauthorized");
+    info!("unauthorized");
     let html = "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
     stream.write_all(&html.as_bytes())?;
     Ok(())
@@ -368,7 +393,7 @@ fn return_401_unauthorized(stream: &mut TcpStream) -> Result<()> {
 
 fn return_404_not_found(stream: &mut TcpStream, unknown_path: Option<&str>) -> Result<()> {
     thread::sleep(Duration::from_secs(2));
-    info!("Unknown path: {:?}", unknown_path);
+    info!("unknown path: {:?}", unknown_path);
     let html = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
     stream.write_all(&html.as_bytes())?;
     Ok(())
