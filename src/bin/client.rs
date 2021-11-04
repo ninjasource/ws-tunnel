@@ -1,19 +1,48 @@
 use dotenv::dotenv;
 use embedded_websocket::{
     framer::{Framer, FramerError, ReadResult, Stream},
-    WebSocketClient, WebSocketOptions, WebSocketSendMessageType, WebSocketState,
+    WebSocketClient, WebSocketOptions, WebSocketSendMessageType,
 };
 use log::{debug, error, info};
-use rand::prelude::ThreadRng;
+//use rand::prelude::ThreadRng;
 use std::{
     error::Error,
+    io::ErrorKind,
     net::{Shutdown, TcpStream},
-    sync::mpsc::{channel, Sender},
+    sync::mpsc::{channel, RecvTimeoutError, Sender},
     thread,
     time::Duration,
 };
 use url::Url;
 use ws_tunnel::{CLOSE_STREAM_COMMAND, OPEN_STREAM_COMMAND};
+
+use std::sync::Arc;
+
+use std::convert::TryInto;
+
+use rustls::{self, ClientConnection, ServerName};
+use webpki_roots;
+
+use rustls::{OwnedTrustAnchor, RootCertStore};
+
+struct TlsStream<'a> {
+    tls: rustls::Stream<'a, ClientConnection, TcpStream>,
+}
+
+impl<'a> embedded_websocket::framer::Stream<std::io::Error> for TlsStream<'a> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, std::io::Error> {
+        std::io::Read::read(&mut self.tls, buf)
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> Result<(), std::io::Error> {
+        std::io::Write::write_all(&mut self.tls, buf)
+    }
+}
+
+enum EgresPayload {
+    Ping,
+    TunnelBytes(Vec<u8>),
+}
 
 fn main() -> Result<(), FramerError<impl Error>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -29,11 +58,32 @@ fn main() -> Result<(), FramerError<impl Error>> {
         None => host.to_owned(),
     };
 
-    info!("connecting to: {}", address);
-    let mut stream = TcpStream::connect(address).map_err(FramerError::Io)?;
-    let mut stream_tx1 = stream.try_clone().expect("Unable to clone stream");
-    let mut stream_tx2 = stream.try_clone().expect("Unable to clone stream");
-    info!("connected");
+    info!("Connecting to: {}", address);
+
+    let mut root_store = RootCertStore::empty();
+    root_store.add_server_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.0.iter().map(|ta| {
+        OwnedTrustAnchor::from_subject_spki_name_constraints(
+            ta.subject,
+            ta.spki,
+            ta.name_constraints,
+        )
+    }));
+    let tls_config = rustls::ClientConfig::builder()
+        .with_safe_defaults()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+
+    let server_name: ServerName = address.as_str().try_into().unwrap();
+    let mut connection = rustls::ClientConnection::new(Arc::new(tls_config), server_name).unwrap();
+    let mut stream = TcpStream::connect(format!("{}:443", &address)).map_err(FramerError::Io)?;
+
+    const TIMEOUT: Duration = Duration::from_millis(50);
+    stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+
+    let tls = rustls::Stream::new(&mut connection, &mut stream);
+    let mut stream = TlsStream { tls };
+
+    info!("Tcp connected");
 
     let mut read_buf = [0; 4000];
     let mut read_cursor = 0;
@@ -59,55 +109,27 @@ fn main() -> Result<(), FramerError<impl Error>> {
         &mut write_buf,
         &mut websocket,
     );
-    framer.connect(&mut stream, &websocket_options)?;
 
-    // ingres is tcp data coming from this machine
-    let (tx_ingres, rx_ingres) = channel::<Vec<u8>>();
+    loop {
+        match framer.connect(&mut stream, &websocket_options) {
+            Ok(_) => break, // do nothing
+            Err(FramerError::Io(e)) if e.kind() == ErrorKind::WouldBlock => {
+                // a normal timeout
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    info!("Websocket connected");
+
+    // egres is tcp data leaving this machine via websocket
+    let (tx_egres, rx_egres) = channel::<EgresPayload>();
+    let tx_egres_clone = tx_egres.clone();
 
     // heartbeat
-    thread::spawn(move || {
-        let mut websocket_tx = WebSocketClient::new_client(rand::thread_rng());
-        websocket_tx.state = WebSocketState::Open;
-        let mut to_buf = vec![0_u8; 128];
-        let from_buf = Vec::new();
-        loop {
-            write_to_websocket(
-                &mut websocket_tx,
-                &mut stream_tx2,
-                WebSocketSendMessageType::Ping,
-                &from_buf,
-                &mut to_buf,
-            );
-            thread::sleep(Duration::from_secs(20))
-        }
-    });
-
-    // receive bytes comming from internal stream and push them onto the websocket
-    thread::spawn(move || {
-        let mut websocket_tx = WebSocketClient::new_client(rand::thread_rng());
-        websocket_tx.state = WebSocketState::Open;
-        let mut to_buf = vec![0_u8; 4096];
-        loop {
-            match rx_ingres.recv() {
-                Ok(tunnel_bytes) => {
-                    let len = websocket_tx
-                        .write(
-                            WebSocketSendMessageType::Binary,
-                            true,
-                            &tunnel_bytes,
-                            &mut to_buf,
-                        )
-                        .unwrap();
-                    stream_tx1.write_all(&to_buf[..len]).unwrap();
-
-                    debug!("sent {} bytes to websocket", tunnel_bytes.len())
-                }
-                Err(e) => {
-                    error!("rx_ingres recv error: {:?}", e);
-                    break;
-                }
-            }
-        }
+    thread::spawn(move || loop {
+        tx_egres_clone.send(EgresPayload::Ping).unwrap();
+        thread::sleep(Duration::from_secs(20))
     });
 
     // receive bytes comming from websocket and push them to the internal stream
@@ -115,89 +137,96 @@ fn main() -> Result<(), FramerError<impl Error>> {
     loop {
         match framer.read(&mut stream, &mut frame_buf) {
             Ok(ReadResult::Text(command)) => {
-                info!("received command: {}", command);
+                info!("Received command: {}", command);
 
                 if command == OPEN_STREAM_COMMAND {
-                    if let Some(stream) = tunnel.as_mut() {
-                        stream.shutdown(Shutdown::Both).unwrap();
-                    }
-
-                    tunnel = Some(open_tunnel(&config.client_tcp_addr, tx_ingres.clone()));
+                    shutdown(&mut tunnel);
+                    tunnel = Some(open_tunnel(&config.client_tcp_addr, tx_egres.clone()));
                 } else if command == CLOSE_STREAM_COMMAND {
-                    if let Some(stream) = tunnel.as_mut() {
-                        stream.shutdown(Shutdown::Both).unwrap();
-                    }
-
+                    shutdown(&mut tunnel);
                     tunnel = None;
                 } else {
-                    error!("unknown command: {}", command)
+                    error!("Unknown command: {}", command)
                 }
             }
             Ok(ReadResult::Binary(buf)) => {
-                debug!("received {} bytes from websocket", buf.len());
-                if let Some(stream) = tunnel.as_mut() {
-                    stream
-                        .write_all(buf)
-                        .map_err(|e| FramerError::Io(e))
-                        .unwrap();
-                    debug!("send {} bytes to tunnel", buf.len());
+                debug!("Received {} bytes from websocket", buf.len());
+                if let Some(s) = tunnel.as_mut() {
+                    s.write_all(buf).map_err(|e| FramerError::Io(e)).unwrap();
+                    debug!("Send {} bytes to tunnel", buf.len());
                 }
             }
             Ok(ReadResult::Pong(_)) => {} // do nothing
             Ok(ReadResult::Closed) => break,
+            Err(FramerError::Io(e)) if e.kind() == ErrorKind::WouldBlock => {
+                // a normal timeout
+            }
             Err(e) => {
-                error!("framer read error: {:?}", e)
+                error!("Framer read error: {:?}", e);
+                return Err(e);
+            }
+        }
+
+        loop {
+            match rx_egres.recv_timeout(TIMEOUT) {
+                Ok(EgresPayload::Ping) => {
+                    let bytes = [];
+                    framer.write(&mut stream, WebSocketSendMessageType::Ping, true, &bytes)?
+                }
+                Ok(EgresPayload::TunnelBytes(bytes)) => {
+                    framer.write(&mut stream, WebSocketSendMessageType::Binary, true, &bytes)?
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    // a normal timeout
+                    break;
+                }
+                Err(e) => {
+                    error!("Channel error rx_egres recv: {:?}", &e);
+                    return Err(FramerError::Io(std::io::Error::new(ErrorKind::Other, e)));
+                }
             }
         }
     }
 
-    fn write_to_websocket(
-        websocket: &mut WebSocketClient<ThreadRng>,
-        stream: &mut TcpStream,
-        message_type: WebSocketSendMessageType,
-        from_buf: &[u8],
-        to_buf: &mut [u8],
-    ) {
-        // TODO: write in loop if buffer is too small
-        let len = websocket
-            .write(message_type, true, from_buf, to_buf)
-            .unwrap();
-        stream.write_all(&to_buf[..len]).unwrap();
+    info!("Connection closed");
+    Ok(())
+}
+
+fn shutdown(tunnel: &mut Option<TcpStream>) {
+    if let Some(s) = tunnel {
+        s.shutdown(Shutdown::Both).unwrap();
     }
+}
 
-    fn open_tunnel(client_tcp_addr: &str, tx_ingres: Sender<Vec<u8>>) -> TcpStream {
-        let stream = TcpStream::connect(client_tcp_addr)
-            .map_err(FramerError::Io)
-            .unwrap();
+fn open_tunnel(client_tcp_addr: &str, tx_engres: Sender<EgresPayload>) -> TcpStream {
+    let stream = TcpStream::connect(client_tcp_addr)
+        .map_err(FramerError::Io)
+        .unwrap();
 
-        let mut tunnel_clone = stream.try_clone().expect("clone tunnel failed");
+    let mut tunnel_clone = stream.try_clone().expect("Clone tunnel failed");
 
-        // tunnel read loop
-        thread::spawn(move || {
-            let mut buf = vec![0_u8; 4096 * 4];
-            loop {
-                // todo: consider using a buffered reader here
-                match tunnel_clone.read(&mut buf) {
-                    Ok(0) => {
-                        info!("tunnel closed");
-                        break;
-                    }
-                    Ok(len) => {
-                        debug!("received {} bytes from tunnel", len);
-                        let bytes = Vec::from(&buf[..len]);
-                        tx_ingres.send(bytes).unwrap();
-                    }
-                    Err(e) => {
-                        error!("tunnel read error: {:?}", e); // TODO: ignore stream close errors
-                        break;
-                    }
+    // tunnel read loop
+    thread::spawn(move || {
+        let mut buf = vec![0_u8; 4096 * 4];
+        loop {
+            // todo: consider using a buffered reader here
+            match tunnel_clone.read(&mut buf) {
+                Ok(0) => {
+                    info!("Tunnel closed");
+                    break;
+                }
+                Ok(len) => {
+                    debug!("Received {} bytes from tunnel", len);
+                    let bytes = Vec::from(&buf[..len]);
+                    tx_engres.send(EgresPayload::TunnelBytes(bytes)).unwrap();
+                }
+                Err(e) => {
+                    error!("Tunnel read error: {:?}", e); // TODO: ignore stream close errors
+                    break;
                 }
             }
-        });
+        }
+    });
 
-        stream
-    }
-
-    info!("connection closed");
-    Ok(())
+    stream
 }
