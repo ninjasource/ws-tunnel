@@ -5,8 +5,8 @@ use serde_derive::Deserialize;
 pub struct Config {
     pub client_tcp_addr: String,
     pub ws_url: String,
-    pub server_tcp_port: u16,
-    pub server_ws_port: u16,
+    pub server_tcp_addr: String,
+    pub server_ws_addr: String,
     pub api_key: String,
 }
 

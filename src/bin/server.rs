@@ -142,14 +142,11 @@ fn main() -> std::io::Result<()> {
     dotenv().ok();
     let config = ws_tunnel::config::Config::from_env().expect("Invalid config");
 
-    let addr = format!("127.0.0.1:{}", config.server_ws_port);
-    let listener = TcpListener::bind(&addr)?;
-    info!("websocket listening on: {}", &addr);
-    let tcp_port = config.server_tcp_port;
+    let listener = TcpListener::bind(&config.server_ws_addr)?;
+    info!("websocket listening on: {}", &config.server_ws_addr);
 
-    let tunner_addr = format!("127.0.0.1:{}", tcp_port);
-    let tunnel_listener = TcpListener::bind(&tunner_addr)?;
-    info!("tunnel listening on: {}", &tunner_addr);
+    let tunnel_listener = TcpListener::bind(&config.server_tcp_addr)?;
+    info!("tunnel listening on: {}", &config.server_tcp_addr);
 
     let (tx_ingres, rx_ingres) = channel::<TunnelCommand>();
     let (tx_egres, rx_egres) = channel::<Vec<u8>>();
