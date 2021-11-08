@@ -79,8 +79,8 @@ fn main() -> Result<(), ClientError> {
     let port = match url.port() {
         Some(port) => port,
         None => match url.scheme() {
-            "wss" => 433,
-            "https" => 433,
+            "wss" => 443,
+            "https" => 443,
             "ws" => 80,
             "http" => 80,
             _ => return Err(ClientError::Url("Invalid url, unknown port".to_owned())),
@@ -89,12 +89,6 @@ fn main() -> Result<(), ClientError> {
 
     let use_tls = url.scheme() == "wss" || url.scheme() == "https";
     let tcp_address = format!("{}:{}", host, port);
-    info!(
-        "Connecting on url Scheme {} port {:?} use_tls: {}",
-        url.scheme(),
-        url.port(),
-        use_tls
-    );
 
     info!("Connecting to: {}, use tls: {}", tcp_address, use_tls);
     const TIMEOUT: Duration = Duration::from_millis(50);
