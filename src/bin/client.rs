@@ -76,8 +76,6 @@ fn main() -> Result<(), ClientError> {
     let url = Url::parse(&config.ws_url).expect("Invalid client_ws_url");
     let host = url.host_str().expect("Invalid url host name");
 
-    info!("scheme {} port {:?}", url.scheme(), url.port());
-
     let port = match url.port() {
         Some(port) => port,
         None => match url.scheme() {
@@ -91,6 +89,12 @@ fn main() -> Result<(), ClientError> {
 
     let use_tls = url.scheme() == "wss" || url.scheme() == "https";
     let tcp_address = format!("{}:{}", host, port);
+    info!(
+        "Connecting on url Scheme {} port {:?} use_tls: {}",
+        url.scheme(),
+        url.port(),
+        use_tls
+    );
 
     info!("Connecting to: {}, use tls: {}", tcp_address, use_tls);
     const TIMEOUT: Duration = Duration::from_millis(50);

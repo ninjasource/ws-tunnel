@@ -9,3 +9,9 @@ pub enum TunnelCommand {
     Tx(Vec<u8>),
     ClientDisconnected,
 }
+
+pub enum EgresCommand {
+    Bytes(Vec<u8>),
+    Close,
+    WebsocketClosed,
+}

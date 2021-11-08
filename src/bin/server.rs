@@ -5,7 +5,8 @@ use base64::DecodeError;
 use embedded_websocket as ws;
 use httparse::Header;
 use log::{debug, error, info, warn};
-use std::net::{TcpListener, TcpStream};
+use std::any::Any;
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::str::{from_utf8, Utf8Error};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -23,7 +24,7 @@ use ws::{
 };
 use ws_tunnel::config::{ConfigError, ServerConfig};
 
-use ws_tunnel::{TunnelCommand, CLOSE_STREAM_COMMAND, OPEN_STREAM_COMMAND};
+use ws_tunnel::{EgresCommand, TunnelCommand, CLOSE_STREAM_COMMAND, OPEN_STREAM_COMMAND};
 type Result<T> = core::result::Result<T, ServerError>;
 
 #[derive(Debug)]
@@ -34,6 +35,8 @@ pub enum ServerError {
     Utf8Error,
     Config(ConfigError),
     Base64(DecodeError),
+    AcceptConnectionThread(Box<dyn Any + Send>),
+    WriteThread(Box<dyn Any + Send>),
 }
 
 impl From<std::io::Error> for ServerError {
@@ -60,81 +63,97 @@ impl From<Utf8Error> for ServerError {
     }
 }
 
-fn accept_tunnel_connections(
-    tunnel_listener: TcpListener,
-    tx_ingres: Sender<TunnelCommand>,
-    rx_egres: Receiver<Vec<u8>>,
-    tx_egres: Sender<Vec<u8>>,
-) {
-    for stream in tunnel_listener.incoming() {
-        match stream {
-            Ok(mut stream) => {
-                info!("Incomming tunnel connection from {:?}", stream.peer_addr());
-                let mut stream_clone = stream.try_clone().unwrap();
-                let tx_ingres_clone = tx_ingres.clone();
-                tx_ingres_clone.send(TunnelCommand::Open).unwrap();
-                let tx_egres_clone = tx_egres.clone();
-                thread::spawn(move || {
-                    info!("Reading bytes from tunnel and forwarding them to websocket");
-                    let mut buf = vec![0_u8; 4 * 4096];
-                    loop {
-                        match stream.read(&mut buf) {
-                            Ok(0) => {
-                                info!("Tunnel closed");
-                                tx_ingres_clone.send(TunnelCommand::Close).ok();
-                                tx_egres_clone.send(Vec::new()).ok(); // send an empty packet
-                                break;
-                            }
-                            Ok(len) => {
-                                let bytes = Vec::from(&buf[..len]);
-                                tx_ingres_clone.send(TunnelCommand::Tx(bytes)).ok();
-                            }
-                            Err(e) => {
-                                error!("Tunnel error: {:?}", e);
-                                tx_ingres_clone.send(TunnelCommand::Close).ok();
-                                break;
-                            }
-                        }
-                    }
-                });
-
-                info!("Waiting for websocket bytes to forward");
-
-                let mut has_received_data = false;
-
-                loop {
-                    match rx_egres.recv() {
-                        Ok(bytes) => {
-                            if bytes.len() == 0 {
-                                if has_received_data {
-                                    info!("Channel rx_egres received 0 bytes and quitting");
-                                    break;
-                                } else {
-                                    info!("Channel rx_egres received 0 bytes but continuing to receive");
-                                    continue;
-                                }
-                            }
-
-                            debug!("Channel rx_egres received {} bytes", bytes.len());
-                            has_received_data = true;
-
-                            if let Err(e) = stream_clone.write_all(&bytes) {
-                                error!("Stream write error: {:?}", e);
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            error!("Channel rx_egres read error: {:?}", e);
-                            break;
-                        }
-                    }
+fn handle_tunnel_connection(
+    mut stream: TcpStream,
+    tx_ingres: &mut Sender<TunnelCommand>,
+    rx_egres: &mut Receiver<EgresCommand>,
+    tx_egres: &mut Sender<EgresCommand>,
+) -> Result<bool> {
+    info!("Incomming tunnel connection from {:?}", stream.peer_addr());
+    let mut stream_clone = stream.try_clone().unwrap();
+    let tx_ingres_clone = tx_ingres.clone();
+    tx_ingres_clone.send(TunnelCommand::Open).unwrap();
+    let tx_egres_clone = tx_egres.clone();
+    thread::spawn(move || {
+        info!("Reading bytes from tunnel and forwarding them to websocket");
+        let mut buf = vec![0_u8; 4000];
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) => {
+                    info!("Tunnel closed");
+                    tx_ingres_clone.send(TunnelCommand::Close).ok();
+                    tx_egres_clone.send(EgresCommand::Close).ok();
+                    break;
                 }
-
-                info!("No longer forwarding websocket bytes to tunnel");
+                Ok(len) => {
+                    let bytes = Vec::from(&buf[..len]);
+                    tx_ingres_clone.send(TunnelCommand::Tx(bytes)).ok();
+                }
+                Err(e) => {
+                    error!("Tunnel error: {:?}", e);
+                    tx_ingres_clone.send(TunnelCommand::Close).ok();
+                    tx_egres_clone.send(EgresCommand::Close).ok();
+                    break;
+                }
             }
-            Err(e) => error!("Failed to establish a connection: {}", e),
+        }
+
+        info!("No longer reading bytes from tunnel");
+    });
+
+    info!("Waiting for websocket bytes to forward");
+
+    loop {
+        match rx_egres.recv() {
+            Ok(EgresCommand::Bytes(bytes)) => {
+                debug!("Channel rx_egres received {} bytes", bytes.len());
+                if let Err(e) = stream_clone.write_all(&bytes) {
+                    error!("Stream write error: {:?}", e);
+                    return Ok(false);
+                }
+            }
+            Ok(EgresCommand::Close) => {
+                info!("Received EgresCommand Close");
+                return Ok(true);
+            }
+            Ok(EgresCommand::WebsocketClosed) => {
+                info!("Received EgresCommand WebsocketClosed");
+                stream_clone.shutdown(Shutdown::Both)?;
+                return Ok(false);
+            }
+            Err(e) => {
+                error!("Channel rx_egres read error: {:?}", e);
+                return Ok(false);
+            }
         }
     }
+}
+
+fn accept_tunnel_connections(
+    tunnel_listener: TcpListener,
+    mut tx_ingres: Sender<TunnelCommand>,
+    mut rx_egres: Receiver<EgresCommand>,
+    mut tx_egres: Sender<EgresCommand>,
+) -> Result<()> {
+    for stream in tunnel_listener.incoming() {
+        match stream {
+            Ok(stream) => {
+                match handle_tunnel_connection(stream, &mut tx_ingres, &mut rx_egres, &mut tx_egres)
+                {
+                    Ok(true) => continue,
+                    Ok(false) => break,
+                    Err(e) => Err(e)?,
+                }
+            }
+            Err(e) => {
+                error!("Failed to establish a connection: {}", e);
+                Err(e)?
+            }
+        }
+    }
+
+    info!("No longer accepting tunnel connections");
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -168,9 +187,67 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn write_to_websocket_loop(
+    mut stream: TcpStream,
+    rx_ingres_mutex: Arc<Mutex<Receiver<TunnelCommand>>>,
+) -> Result<()> {
+    let mut to_buf = vec![0_u8; 4 * 4096];
+    let mut websocket_tx = WebSocketServer::new_server();
+    websocket_tx.state = WebSocketState::Open;
+
+    loop {
+        let rx_ingres = rx_ingres_mutex.lock().unwrap();
+
+        // attempt to read from the channel and write websocket frame
+        match rx_ingres.recv() {
+            Ok(TunnelCommand::Open) => {
+                info!("Sending 'open' stream message to websocket");
+                write_to_websocket(
+                    &mut websocket_tx,
+                    &mut stream,
+                    WebSocketSendMessageType::Text,
+                    OPEN_STREAM_COMMAND.as_bytes(),
+                    &mut to_buf,
+                );
+            }
+            Ok(TunnelCommand::Close) => {
+                info!("Sending 'close' stream message to websocket");
+                write_to_websocket(
+                    &mut websocket_tx,
+                    &mut stream,
+                    WebSocketSendMessageType::Text,
+                    CLOSE_STREAM_COMMAND.as_bytes(),
+                    &mut to_buf,
+                );
+            }
+            Ok(TunnelCommand::Tx(bytes)) => {
+                debug!("Sending {} bytes to websocket", bytes.len());
+
+                write_to_websocket(
+                    &mut websocket_tx,
+                    &mut stream,
+                    WebSocketSendMessageType::Binary,
+                    &bytes,
+                    &mut to_buf,
+                );
+            }
+            Ok(TunnelCommand::ClientDisconnected) => {
+                info!("Client disconnected, exiting websocket writer loop");
+                break;
+            }
+            Err(e) => {
+                error!("Channel rx_ingres disconnected: {:?}", e);
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn handle_client(mut stream: TcpStream, config: ServerConfig) -> Result<()> {
     info!("Client connected {}", stream.peer_addr()?);
-    let mut read_buf = [0; 4000];
+    let mut read_buf = vec![0_u8; 4000];
     let mut read_cursor = 0;
 
     if let Some((websocket_context, tunnel_tcp_address)) =
@@ -180,20 +257,21 @@ fn handle_client(mut stream: TcpStream, config: ServerConfig) -> Result<()> {
         info!("Tunnel listening on: {}", &tunnel_tcp_address.0);
 
         let (tx_ingres, rx_ingres) = channel::<TunnelCommand>();
-        let (tx_egres, rx_egres) = channel::<Vec<u8>>();
+        let (tx_egres, rx_egres) = channel::<EgresCommand>();
 
+        // accept tunnel connection loop
         let tx_egres_clone = tx_egres.clone();
         let tx_ingres_clone = tx_ingres.clone();
-        thread::spawn(move || {
-            accept_tunnel_connections(tunnel_listener, tx_ingres_clone, rx_egres, tx_egres_clone);
-            info!("Stopped accepting tunnel connections")
+        let accept_connection_thread = thread::spawn(move || -> Result<()> {
+            accept_tunnel_connections(tunnel_listener, tx_ingres_clone, rx_egres, tx_egres_clone)
         });
 
         let rx_ingres_mutex = Arc::new(Mutex::new(rx_ingres));
 
         // this is a websocket upgrade HTTP request
-        let mut write_buf = [0; 4000];
-        let mut frame_buf = [0; 4000];
+
+        let mut write_buf = vec![0_u8; 4096];
+        let mut frame_buf = vec![0_u8; 4096];
         let mut websocket = WebSocketServer::new_server();
         let mut framer = Framer::new(
             &mut read_buf,
@@ -206,58 +284,10 @@ fn handle_client(mut stream: TcpStream, config: ServerConfig) -> Result<()> {
         framer.accept(&mut stream, &websocket_context)?;
         info!("Websocket connection opened");
 
-        let mut stream_cloned = stream.try_clone().expect("unable to clone stream");
-        thread::spawn(move || {
-            let mut to_buf = vec![0_u8; 4 * 4096];
-            let mut websocket_tx = WebSocketServer::new_server();
-            websocket_tx.state = WebSocketState::Open;
-
-            loop {
-                let rx_ingres = rx_ingres_mutex.lock().unwrap();
-
-                // attempt to read from the channel and write websocket frame
-                match rx_ingres.recv() {
-                    Ok(TunnelCommand::Open) => {
-                        info!("Sending 'open' stream message to websocket");
-                        write_to_websocket(
-                            &mut websocket_tx,
-                            &mut stream_cloned,
-                            WebSocketSendMessageType::Text,
-                            OPEN_STREAM_COMMAND.as_bytes(),
-                            &mut to_buf,
-                        );
-                    }
-                    Ok(TunnelCommand::Close) => {
-                        info!("Sending 'close' stream message to websocket");
-                        write_to_websocket(
-                            &mut websocket_tx,
-                            &mut stream_cloned,
-                            WebSocketSendMessageType::Text,
-                            CLOSE_STREAM_COMMAND.as_bytes(),
-                            &mut to_buf,
-                        );
-                    }
-                    Ok(TunnelCommand::Tx(bytes)) => {
-                        debug!("Sending {} bytes to websocket", bytes.len());
-
-                        write_to_websocket(
-                            &mut websocket_tx,
-                            &mut stream_cloned,
-                            WebSocketSendMessageType::Binary,
-                            &bytes,
-                            &mut to_buf,
-                        );
-                    }
-                    Ok(TunnelCommand::ClientDisconnected) => {
-                        info!("Client disconnected, exiting websocket writer loop");
-                        break;
-                    }
-                    Err(e) => {
-                        error!("Channel rx_ingres disconnected: {:?}", e);
-                        break;
-                    }
-                }
-            }
+        // write to websocket loop
+        let stream_cloned = stream.try_clone().expect("unable to clone stream");
+        let write_thread = thread::spawn(move || -> Result<()> {
+            write_to_websocket_loop(stream_cloned, rx_ingres_mutex)
         });
 
         // read loop
@@ -267,7 +297,7 @@ fn handle_client(mut stream: TcpStream, config: ServerConfig) -> Result<()> {
                 Ok(ReadResult::Binary(bytes)) => {
                     debug!("Received {} bytes from websocket", bytes.len());
                     let bytes = Vec::from(bytes);
-                    if let Err(e) = tx_egres.send(bytes) {
+                    if let Err(e) = tx_egres.send(EgresCommand::Bytes(bytes)) {
                         // this will only happen if we stop accepting incomming tcp connections for some reason
                         error!("Channel tx_egres send error: {:?}", e);
                     }
@@ -276,8 +306,6 @@ fn handle_client(mut stream: TcpStream, config: ServerConfig) -> Result<()> {
                 Ok(ReadResult::Pong(_)) => {} // do nothing
                 Ok(ReadResult::Closed) => {
                     info!("Client closed websocket connection");
-                    tx_egres.send(Vec::new()).unwrap();
-                    tx_ingres.send(TunnelCommand::ClientDisconnected).unwrap();
                     break; // usually when client has closed the connection
                 }
                 Err(e) => {
@@ -287,7 +315,17 @@ fn handle_client(mut stream: TcpStream, config: ServerConfig) -> Result<()> {
             }
         }
 
-        info!("Closing websocket connection");
+        tx_ingres.send(TunnelCommand::ClientDisconnected).ok();
+        info!("Stop writing websocket messages");
+        write_thread.join().map_err(ServerError::WriteThread)??;
+
+        tx_egres.send(EgresCommand::WebsocketClosed).ok();
+        info!("Stop accepting connections");
+        accept_connection_thread
+            .join()
+            .map_err(ServerError::AcceptConnectionThread)??;
+
+        info!("Websocket connection closed");
         Ok(())
     } else {
         Ok(())
