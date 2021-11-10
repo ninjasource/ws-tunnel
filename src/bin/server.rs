@@ -70,10 +70,11 @@ fn handle_tunnel_connection(
     tx_egres: &mut Sender<EgresCommand>,
 ) -> Result<bool> {
     info!("Incomming tunnel connection from {:?}", stream.peer_addr());
-    let mut stream_clone = stream.try_clone().unwrap();
+    let mut stream_clone = stream.try_clone().unwrap(); // this should not fail for tcp streams
     let tx_ingres_clone = tx_ingres.clone();
-    tx_ingres_clone.send(TunnelCommand::Open).unwrap();
+    tx_ingres_clone.send(TunnelCommand::Open).ok();
     let tx_egres_clone = tx_egres.clone();
+
     thread::spawn(move || {
         info!("Reading bytes from tunnel and forwarding them to websocket");
         let mut buf = vec![0_u8; 4000];
@@ -175,6 +176,7 @@ fn main() -> Result<()> {
                 );
 
                 let cfg = config.clone();
+
                 thread::spawn(move || match handle_client(stream, cfg) {
                     Ok(()) => info!("Connection closed"),
                     Err(e) => error!("Http handle_client error: {:?}", e),
@@ -250,26 +252,11 @@ fn handle_client(mut stream: TcpStream, config: ServerConfig) -> Result<()> {
     let mut read_buf = vec![0_u8; 4000];
     let mut read_cursor = 0;
 
-    if let Some((websocket_context, tunnel_tcp_address)) =
-        read_header(&mut stream, &mut read_buf, &mut read_cursor, &config)?
-    {
-        let tunnel_listener = TcpListener::bind(&tunnel_tcp_address.0)?;
-        info!("Tunnel listening on: {}", &tunnel_tcp_address.0);
-
+    if let Some(header) = read_header(&mut stream, &mut read_buf, &mut read_cursor, &config)? {
         let (tx_ingres, rx_ingres) = channel::<TunnelCommand>();
         let (tx_egres, rx_egres) = channel::<EgresCommand>();
 
-        // accept tunnel connection loop
-        let tx_egres_clone = tx_egres.clone();
-        let tx_ingres_clone = tx_ingres.clone();
-        let accept_connection_thread = thread::spawn(move || -> Result<()> {
-            accept_tunnel_connections(tunnel_listener, tx_ingres_clone, rx_egres, tx_egres_clone)
-        });
-
-        let rx_ingres_mutex = Arc::new(Mutex::new(rx_ingres));
-
         // this is a websocket upgrade HTTP request
-
         let mut write_buf = vec![0_u8; 4096];
         let mut frame_buf = vec![0_u8; 4096];
         let mut websocket = WebSocketServer::new_server();
@@ -281,11 +268,23 @@ fn handle_client(mut stream: TcpStream, config: ServerConfig) -> Result<()> {
         );
 
         // complete the opening handshake with the client
-        framer.accept(&mut stream, &websocket_context)?;
-        info!("Websocket connection opened");
+        framer.accept(&mut stream, &header.websocket_context)?;
+        info!("Websocket connection opened for user {}", &header.user);
+
+        let tunnel_listener = TcpListener::bind(&header.tunnel_addr)?;
+        info!("Tunnel listening on: {}", &header.tunnel_addr);
+
+        // accept tunnel connection loop
+        let tx_egres_clone = tx_egres.clone();
+        let tx_ingres_clone = tx_ingres.clone();
+        let accept_connection_thread = thread::spawn(move || -> Result<()> {
+            accept_tunnel_connections(tunnel_listener, tx_ingres_clone, rx_egres, tx_egres_clone)
+        });
+
+        let rx_ingres_mutex = Arc::new(Mutex::new(rx_ingres));
 
         // write to websocket loop
-        let stream_cloned = stream.try_clone().expect("unable to clone stream");
+        let stream_cloned = stream.try_clone().unwrap(); // will always work
         let write_thread = thread::spawn(move || -> Result<()> {
             write_to_websocket_loop(stream_cloned, rx_ingres_mutex)
         });
@@ -300,6 +299,7 @@ fn handle_client(mut stream: TcpStream, config: ServerConfig) -> Result<()> {
                     if let Err(e) = tx_egres.send(EgresCommand::Bytes(bytes)) {
                         // this will only happen if we stop accepting incomming tcp connections for some reason
                         error!("Channel tx_egres send error: {:?}", e);
+                        break;
                     }
                 }
                 Ok(ReadResult::Text(_)) => {} // do nothing
@@ -317,14 +317,16 @@ fn handle_client(mut stream: TcpStream, config: ServerConfig) -> Result<()> {
 
         tx_ingres.send(TunnelCommand::ClientDisconnected).ok();
         info!("Stop writing websocket messages");
-        write_thread.join().map_err(ServerError::WriteThread)??;
+        let join_write_thread = write_thread.join().map_err(ServerError::WriteThread);
 
         tx_egres.send(EgresCommand::WebsocketClosed).ok();
         info!("Stop accepting connections");
-        accept_connection_thread
+        let join_accept_connection_thread = accept_connection_thread
             .join()
-            .map_err(ServerError::AcceptConnectionThread)??;
+            .map_err(ServerError::AcceptConnectionThread);
 
+        join_write_thread??;
+        join_accept_connection_thread??;
         info!("Websocket connection closed");
         Ok(())
     } else {
@@ -382,14 +384,18 @@ fn read_authorization_header<'a>(headers: &[Header]) -> Result<Option<(String, S
     Ok(None)
 }
 
-struct TunnelTcpAddress(String);
+struct WebSocketHeader {
+    tunnel_addr: String,
+    user: String,
+    websocket_context: WebSocketContext,
+}
 
 fn read_header(
     stream: &mut TcpStream,
     read_buf: &mut [u8],
     read_cursor: &mut usize,
     config: &ServerConfig,
-) -> Result<Option<(WebSocketContext, TunnelTcpAddress)>> {
+) -> Result<Option<WebSocketHeader>> {
     loop {
         let mut headers = [httparse::EMPTY_HEADER; 16];
         let mut request = httparse::Request::new(&mut headers);
@@ -412,10 +418,11 @@ fn read_header(
                             if let Some(pair) = auth {
                                 for client in config.clients.iter() {
                                     if client.username == pair.0 && client.password == pair.1 {
-                                        return Ok(Some((
+                                        return Ok(Some(WebSocketHeader {
+                                            user: client.username.clone(),
+                                            tunnel_addr: client.tcp_addr.clone(),
                                             websocket_context,
-                                            TunnelTcpAddress(client.tcp_addr.clone()),
-                                        )));
+                                        }));
                                     }
                                 }
                             }
