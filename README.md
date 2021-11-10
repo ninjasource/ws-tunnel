@@ -58,6 +58,7 @@ Create a file called `example.com.service` as follows:
 ```
 [Unit]
 Description=Example Websocket Server Tunnel
+After=network-online.target
 
 [Service]
 WorkingDirectory=/var/www/example.com
@@ -71,7 +72,7 @@ User=www-data
 TimeoutStopSec=30
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=network-online.target
 ```
 
 Making sure your service starts automatically on boot-up
@@ -109,6 +110,7 @@ Copy the built `client` binary and its config file `client.conf` to `/usr/bin/ws
 ```
 [Unit]
 Description=Example Websocket Client Tunnel
+After=network-online.target
 
 [Service]
 WorkingDirectory=/usr/bin/ws-tunnel
@@ -122,7 +124,7 @@ User=www-data
 TimeoutStopSec=30
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=network-online.target
 ```
 
 Enable the client service
