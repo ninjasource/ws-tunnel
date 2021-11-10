@@ -2,7 +2,7 @@ use embedded_websocket::{
     framer::{Framer, FramerError, ReadResult, Stream},
     WebSocketClient, WebSocketOptions, WebSocketSendMessageType,
 };
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use rustls::{self, ClientConnection, ServerName};
 use rustls::{OwnedTrustAnchor, RootCertStore};
 use std::sync::Arc;
@@ -40,6 +40,14 @@ impl<'a> Stream<std::io::Error> for ClientStream {
         } else {
             std::io::Write::write_all(&mut self.stream, buf)
         }
+    }
+}
+
+impl ClientStream {
+    fn set_read_timeout(&mut self, duration: Duration) -> Result<(), ClientError> {
+        self.stream
+            .set_read_timeout(Some(duration))
+            .map_err(ClientError::Io)
     }
 }
 
@@ -91,7 +99,6 @@ fn main() -> Result<(), ClientError> {
     let tcp_address = format!("{}:{}", host, port);
 
     info!("Connecting to: {}, use tls: {}", tcp_address, use_tls);
-    const TIMEOUT: Duration = Duration::from_millis(50);
 
     let connection = if use_tls {
         let mut root_store = RootCertStore::empty();
@@ -119,8 +126,6 @@ fn main() -> Result<(), ClientError> {
     };
 
     let stream = TcpStream::connect(tcp_address)?;
-    stream.set_read_timeout(Some(TIMEOUT))?;
-
     let mut stream = ClientStream { connection, stream };
 
     info!("Tcp connected");
@@ -175,6 +180,8 @@ fn main() -> Result<(), ClientError> {
         thread::sleep(Duration::from_secs(20))
     });
 
+    stream.set_read_timeout(Duration::from_millis(100))?;
+
     // receive bytes comming from websocket and push them to the internal stream
     let mut tunnel: Option<TcpStream> = None;
     loop {
@@ -183,11 +190,11 @@ fn main() -> Result<(), ClientError> {
                 info!("Received command: {}", command);
 
                 if command == OPEN_STREAM_COMMAND {
-                    shutdown(&mut tunnel)?;
+                    shutdown(&mut tunnel, true)?;
                     let new_stream = open_tunnel(&config.tcp_addr, tx_egres.clone())?;
                     tunnel = Some(new_stream);
                 } else if command == CLOSE_STREAM_COMMAND {
-                    shutdown(&mut tunnel)?;
+                    shutdown(&mut tunnel, false)?;
                     tunnel = None;
                 } else {
                     error!("Unknown command: {}", command)
@@ -198,6 +205,9 @@ fn main() -> Result<(), ClientError> {
                 if let Some(s) = tunnel.as_mut() {
                     s.write_all(buf)?;
                     debug!("Send {} bytes to tunnel", buf.len());
+                } else {
+                    error!("Recieved {} bytes from a closed tunnel", buf.len());
+                    return Ok(());
                 }
             }
             Ok(ReadResult::Pong(_)) => {} // do nothing
@@ -212,7 +222,7 @@ fn main() -> Result<(), ClientError> {
         }
 
         loop {
-            match rx_egres.recv_timeout(TIMEOUT) {
+            match rx_egres.recv_timeout(Duration::from_millis(25)) {
                 Ok(EgresPayload::Ping) => {
                     let bytes = [];
                     framer.write(&mut stream, WebSocketSendMessageType::Ping, true, &bytes)?
@@ -236,8 +246,11 @@ fn main() -> Result<(), ClientError> {
     Ok(())
 }
 
-fn shutdown(tunnel: &mut Option<TcpStream>) -> Result<(), ClientError> {
+fn shutdown(tunnel: &mut Option<TcpStream>, is_forced: bool) -> Result<(), ClientError> {
     if let Some(s) = tunnel {
+        if is_forced {
+            warn!("Attempted to open tunnel that is already open, shutting down first");
+        }
         s.shutdown(Shutdown::Both)?;
     }
 
@@ -256,7 +269,6 @@ fn open_tunnel(
     thread::spawn(move || {
         let mut buf = vec![0_u8; 4096 * 4];
         loop {
-            // TODO: consider using a buffered reader here
             match tunnel_clone.read(&mut buf) {
                 Ok(0) => {
                     info!("Tunnel closed");
